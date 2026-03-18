@@ -8,7 +8,7 @@ import org.logging.sink.Sink;
 public class Logger {
 
     private final String name;
-    private LoggerConfig config;
+    private volatile LoggerConfig config;
 
     public Logger(String name, LoggerConfig config) {
         this.name = name;

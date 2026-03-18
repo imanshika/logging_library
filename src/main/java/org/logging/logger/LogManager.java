@@ -11,7 +11,7 @@ public class LogManager {
 
     private static final ConcurrentHashMap<String, Logger> loggers = new ConcurrentHashMap<>();
 
-    private static LoggerConfig defaultConfig = LoggerConfig.builder()
+    private static volatile LoggerConfig defaultConfig = LoggerConfig.builder()
             .level(LogLevel.INFO)
             .addSink(new ConsoleSink())
             .formatter(new DefaultLogFormatter())

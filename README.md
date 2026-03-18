@@ -18,10 +18,12 @@ multiple output destinations, configurable formatting, and thread-safe operation
 │  WARN        │
 │  ERROR       │
 │  FATAL       │
+│─────────────│
+│  + isAtLeast(LogLevel) : boolean  │
 └─────────────┘
 
 ┌──────────────────────────────────┐
-│  LogMessage                      │  (model / POJO)
+│  LogMessage        (immutable)   │
 │──────────────────────────────────│
 │  - level      : LogLevel         │
 │  - message    : String           │
@@ -36,37 +38,45 @@ multiple output destinations, configurable formatting, and thread-safe operation
 │  + format(LogMessage) : String   │
 └──────────────┬───────────────────┘
                │
-      ┌────────┴─────────┐
-      │ DefaultFormatter  │  → "2026-03-18 12:00:00 [INFO] [OrderService] message"
-      └──────────────────┘
+      ┌────────┴──────────────┐
+      │ DefaultLogFormatter    │  → "2026-03-18 12:00:00.123 [INFO] [OrderService] [main] message"
+      └───────────────────────┘
 
 ┌──────────────────────────────────────┐
 │  <<interface>> Sink                  │
 │──────────────────────────────────────│
 │  + write(LogMessage, LogFormatter)   │
+│  + close()          (default no-op)  │
 └──────────────┬───────────────────────┘
                │
-      ┌────────┼────────────────┐
-      │        │                │
-┌───────────┐ ┌──────────┐ ┌────────────────┐
-│ConsoleSink│ │ FileSink  │ │AsyncSinkDecorator│  (wraps any Sink)
-└───────────┘ └──────────┘ └────────────────┘
+      ┌────────┼──────────────────┐
+      │        │                  │
+┌───────────┐ ┌──────────────┐ ┌──────────────────┐
+│ConsoleSink│ │   FileSink   │ │AsyncSinkDecorator│
+│           │ │ (synchronized│ │ (Decorator)      │
+│           │ │  + shared    │ │ wraps any Sink   │
+│           │ │  writer)     │ │ with BlockingQ   │
+└───────────┘ └──────────────┘ └──────────────────┘
 
 ┌──────────────────────────────────────────┐
-│  LoggerConfig                            │
+│  LoggerConfig             (Builder)      │
 │──────────────────────────────────────────│
 │  - level      : LogLevel                 │
-│  - sinks      : List<Sink>              │
+│  - sinks      : List<Sink> (unmodifiable)│
 │  - formatter  : LogFormatter             │
 │──────────────────────────────────────────│
-│  + builder()  : LoggerConfigBuilder      │
+│  + builder()  : Builder                  │
+│    .level(LogLevel)      → Builder       │
+│    .addSink(Sink)        → Builder       │
+│    .formatter(LogFormatter) → Builder    │
+│    .build()              → LoggerConfig  │
 └──────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────┐
 │  Logger                                  │
 │──────────────────────────────────────────│
-│  - name       : String                   │
-│  - config     : LoggerConfig             │
+│  - name       : String         (final)   │
+│  - config     : LoggerConfig   (volatile)│
 │──────────────────────────────────────────│
 │  + log(LogLevel, String)                 │
 │  + debug(String)                         │
@@ -79,62 +89,100 @@ multiple output destinations, configurable formatting, and thread-safe operation
 ┌──────────────────────────────────────────┐
 │  LogManager                (Singleton)   │
 │──────────────────────────────────────────│
-│  - loggers : Map<String, Logger>         │
-│  - defaultConfig : LoggerConfig          │
+│  - loggers : ConcurrentHashMap           │
+│  - defaultConfig : LoggerConfig (volatile)│
 │──────────────────────────────────────────│
 │  + getLogger(String name) : Logger       │
 │  + setDefaultConfig(LoggerConfig)        │
+└──────────────────────────────────────────┘
+
+┌──────────────────────────────────────────┐
+│  AsyncSinkDecorator       (Decorator)    │
+│──────────────────────────────────────────│
+│  - wrappedSink : Sink                    │
+│  - queue  : ArrayBlockingQueue<LogTask>  │
+│  - workerThread : Thread  (daemon)       │
+│  - running : volatile boolean            │
+│──────────────────────────────────────────│
+│  + write()   → queue.offer(LogTask)      │
+│  + close()   → drain queue + close sink  │
+│──────────────────────────────────────────│
+│  LogTask (record): message + formatter   │
+│  → captures context at write-time        │
 └──────────────────────────────────────────┘
 ```
 
 ---
 
-## Entities to Create (in implementation order)
+## Entities (in implementation order)
 
 ### 1. `LogLevel` — Enum
 Defines severity. Ordering matters for filtering (`DEBUG < INFO < WARN < ERROR < FATAL`).
+Uses ordinal comparison via `isAtLeast()`.
 
 ### 2. `LogMessage` — Immutable Model
-Represents a single log event. Holds level, message text, timestamp, logger name, and thread name.
+Represents a single log event. All fields `final` — thread-safe by design.
+Timestamp and thread name captured automatically at construction.
 
-### 3. `LogFormatter` — Interface
-Single method: `String format(LogMessage msg)`. Allows pluggable formatting.
+### 3. `LogFormatter` — Interface (Strategy)
+Single method: `String format(LogMessage msg)`. Pluggable formatting.
 
 ### 4. `DefaultLogFormatter` — Implementation
-Produces output like: `2026-03-18 12:00:00.123 [INFO] [OrderService] [main] Order placed`
+Produces: `2026-03-18 12:00:00.123 [INFO] [OrderService] [main] Order placed`
 
-### 5. `Sink` — Interface
-Single method: `void write(LogMessage msg, LogFormatter formatter)`. Represents an output destination.
+### 5. `Sink` — Interface (Strategy)
+`void write(LogMessage, LogFormatter)` + `default void close()`.
+Represents an output destination. Adding a new sink = implement this interface.
 
 ### 6. `ConsoleSink` — Sink Implementation
-Writes formatted message to `System.out`.
+Writes to `System.out.println()`. Already thread-safe (println is synchronized internally).
 
 ### 7. `FileSink` — Sink Implementation
-Writes formatted message to a file via `BufferedWriter`.
+- Shared `BufferedWriter` opened once in constructor
+- `write()` is `synchronized` to prevent interleaved writes from multiple threads
+- `close()` flushes and closes the writer
 
-### 8. `LoggerConfig` — Configuration Object
-Holds the log level threshold, list of sinks, and formatter. Use Builder pattern.
+### 8. `LoggerConfig` — Configuration (Fluent Builder)
+Bundles level threshold + sinks + formatter. Built via `LoggerConfig.builder().level().addSink().build()`.
+Sinks list is `unmodifiableList` — immutable after construction.
 
 ### 9. `Logger` — Core Class
-Accepts log calls, checks level threshold, builds `LogMessage`, dispatches to all sinks.
+- `config` is `volatile` for cross-thread visibility
+- `log()` filters by level, creates `LogMessage`, dispatches to all sinks
 
-### 10. `LogManager` — Singleton Registry
-Maintains a `ConcurrentHashMap<String, Logger>`. Factory method `getLogger(name)`.
+### 10. `LogManager` — Singleton Registry (Factory)
+- `ConcurrentHashMap` for thread-safe logger storage
+- `defaultConfig` is `volatile` for cross-thread visibility
+- `computeIfAbsent` for atomic logger creation
 
-### Extension Entities (implement if time permits)
+### 11. `AsyncSinkDecorator` — Decorator
+- Wraps any `Sink` with `ArrayBlockingQueue(1024)` + daemon background thread
+- `write()` calls `queue.offer()` — non-blocking for callers
+- `LogTask` record captures both message and formatter at write-time (snapshot)
+- `close()` sets `running=false`, interrupts worker, drains remaining queue, closes wrapped sink
 
-### 11. `AsyncSinkDecorator` — Decorator around Sink
-Wraps any `Sink` with a `BlockingQueue` + background consumer thread for non-blocking writes.
+---
 
-### 12. `RotatingFileSink` — Decorator around FileSink
-Rotates the file when it exceeds a configured size threshold.
+## Thread Safety Summary
+
+| Component | Mechanism | Why |
+|-----------|-----------|-----|
+| `LogManager.loggers` | `ConcurrentHashMap` | Thread-safe registry, atomic `computeIfAbsent` |
+| `LogManager.defaultConfig` | `volatile` | Simple reference swap — visibility only |
+| `Logger.config` | `volatile` | Simple reference swap — visibility only |
+| `LogMessage` | All fields `final` | Immutable — inherently thread-safe |
+| `LoggerConfig` | Unmodifiable list, final fields | Immutable after build |
+| `ConsoleSink` | `System.out.println` | Internally synchronized by JVM |
+| `FileSink.write()` | `synchronized` method | Prevents interleaved file writes |
+| `AsyncSinkDecorator` | `BlockingQueue` + single consumer thread | Producer-consumer — writes are serial |
+| `AsyncSinkDecorator.running` | `volatile boolean` | Shutdown flag visible across threads |
 
 ---
 
 ## Package Structure
 
 ```
-src/main/java/org/example/
+src/main/java/org/logging/
 ├── model/
 │   ├── LogLevel.java
 │   └── LogMessage.java
@@ -156,35 +204,52 @@ src/main/java/org/example/
 
 ---
 
-## Usage Example (Target API)
+## Usage Example
 
 ```java
-// Configure
+// Wrap FileSink with async decorator for non-blocking writes
+Sink asyncFileSink = new AsyncSinkDecorator(new FileSink("/tmp/app.log"));
+
 LoggerConfig config = LoggerConfig.builder()
-    .level(LogLevel.INFO)
+    .level(LogLevel.DEBUG)
     .addSink(new ConsoleSink())
-    .addSink(new FileSink("/tmp/app.log"))
+    .addSink(asyncFileSink)
     .formatter(new DefaultLogFormatter())
     .build();
 
 LogManager.setDefaultConfig(config);
 
-// Use
 Logger logger = LogManager.getLogger("OrderService");
 logger.info("Order placed for userId=123");
-logger.debug("This will be filtered out since level is INFO");
+logger.debug("Debug details visible at DEBUG level");
 logger.error("Payment gateway timeout");
+
+// Graceful shutdown — drains remaining messages, closes file
+asyncFileSink.close();
 ```
 
 ---
 
 ## Design Patterns Used
 
-| Pattern           | Where                                  |
-|-------------------|----------------------------------------|
-| **Singleton**     | `LogManager`                           |
-| **Strategy**      | `Sink` interface, `LogFormatter`       |
-| **Observer**      | Logger → broadcasts to multiple sinks  |
-| **Builder**       | `LoggerConfig.builder()`               |
-| **Factory**       | `LogManager.getLogger(name)`           |
-| **Decorator**     | `AsyncSinkDecorator`, `RotatingFileSink` |
+| Pattern           | Where                                    |
+|-------------------|------------------------------------------|
+| **Singleton**     | `LogManager` — static methods, private constructor |
+| **Strategy**      | `Sink` interface, `LogFormatter` interface |
+| **Observer**      | Logger → broadcasts to multiple sinks    |
+| **Builder**       | `LoggerConfig.builder().level().addSink().build()` |
+| **Factory**       | `LogManager.getLogger(name)`             |
+| **Decorator**     | `AsyncSinkDecorator` wraps any `Sink`    |
+| **Producer-Consumer** | `AsyncSinkDecorator` — BlockingQueue + worker thread |
+
+---
+
+## Possible Extensions
+
+| Extension | Description |
+|-----------|-------------|
+| **Sink-level filtering** | Different log levels per sink (e.g., ERROR+ to file, DEBUG+ to console) |
+| **RotatingFileSink** | Rotate log file when it exceeds a size threshold |
+| **Parameterized messages** | `logger.info("Order {} by user {}", orderId, userId)` — avoid string concat if filtered |
+| **Structured logging (MDC)** | `ThreadLocal` key-value context attached to every log message |
+| **JSON formatter** | `LogFormatter` impl that outputs structured JSON |

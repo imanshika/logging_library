@@ -5,32 +5,61 @@ import org.logging.formatter.DefaultLogFormatter;
 import org.logging.logger.LogManager;
 import org.logging.logger.Logger;
 import org.logging.model.LogLevel;
+import org.logging.sink.AsyncSinkDecorator;
 import org.logging.sink.ConsoleSink;
 import org.logging.sink.FileSink;
+import org.logging.sink.Sink;
 
 public class Main {
-    public static void main(String[] args) {
+    public static void main(String[] args) throws InterruptedException {
 
-        // 1. Use default config (INFO + ConsoleSink)
-        Logger logger = LogManager.getLogger("Main");
-        logger.info("App started with default config");
-        logger.debug("This won't appear — default level is INFO");
+        // Wrap FileSink with AsyncSinkDecorator for non-blocking writes
+        Sink asyncFileSink = new AsyncSinkDecorator(new FileSink("/tmp/app.log"));
 
-        // 2. Custom config: DEBUG level + Console + File
-        LoggerConfig customConfig = LoggerConfig.builder()
+        LoggerConfig config = LoggerConfig.builder()
                 .level(LogLevel.DEBUG)
                 .addSink(new ConsoleSink())
-                .addSink(new FileSink("/tmp/app.log"))
+                .addSink(asyncFileSink)
                 .formatter(new DefaultLogFormatter())
                 .build();
 
-        LogManager.setDefaultConfig(customConfig);
+        LogManager.setDefaultConfig(config);
 
-        Logger orderLogger = LogManager.getLogger("OrderService");
-        orderLogger.debug("Fetching order details for orderId=42");
-        orderLogger.info("Order placed successfully");
-        orderLogger.warn("Inventory running low for SKU-1001");
-        orderLogger.error("Payment gateway timeout after 30s");
-        orderLogger.fatal("Database connection pool exhausted");
+        Logger logger = LogManager.getLogger("Main");
+
+        // Simulate 3 threads logging concurrently
+        Thread t1 = new Thread(() -> {
+            Logger log = LogManager.getLogger("OrderService");
+            for (int i = 0; i < 5; i++) {
+                log.info("Processing order #" + i);
+            }
+        }, "order-thread");
+
+        Thread t2 = new Thread(() -> {
+            Logger log = LogManager.getLogger("PaymentService");
+            for (int i = 0; i < 5; i++) {
+                log.warn("Payment attempt #" + i);
+            }
+        }, "payment-thread");
+
+        Thread t3 = new Thread(() -> {
+            Logger log = LogManager.getLogger("InventoryService");
+            for (int i = 0; i < 5; i++) {
+                log.error("Stock check #" + i);
+            }
+        }, "inventory-thread");
+
+        t1.start();
+        t2.start();
+        t3.start();
+
+        t1.join();
+        t2.join();
+        t3.join();
+
+        logger.info("All threads completed");
+
+        // Graceful shutdown — drains remaining messages, closes file
+        asyncFileSink.close();
     }
 }
